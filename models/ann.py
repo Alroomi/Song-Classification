@@ -1,0 +1,122 @@
+import os, os.path
+os.environ['TF_CPP_MIN_VLOG_LEVEL'] = '3'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+import tensorflow as tf
+from tensorflow.python import debug as tf_debug
+import tensorflow.contrib.slim as slim
+import tensorflow.contrib.losses as L
+import tensorflow.contrib.keras as K
+import numpy as np 
+
+class Classifier():
+    def __init__(self, configs, log_dir=None):
+        self.parse_cfgs(configs)
+        self.graph = tf.Graph()
+        with self.graph.as_default():
+            self.x = tf.placeholder(tf.float32, [None, self.inp_dim])
+            self.y = tf.placeholder(tf.float32, [None, self.output_dim])
+            self.lr = tf.placeholder(tf.float32, [])    # learning rate
+            self.is_training = tf.placeholder(tf.bool, [], name='is_training')
+
+            # initializer
+            self.initializer = tf.contrib.layers.xavier_initializer 
+            self.transfer = tf.nn.relu 
+
+            self.scores = self.build_classifier(self.x, self.hidden_sizes, self.output_dim, scope='classifier')
+            self.cross_entropy = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=self.y, logits=self.scores))
+            correct_pred = tf.equal(tf.argmax(self.y, 1), tf.argmax(self.scores, 1))
+            self.accuracy = tf.reduce_mean(tf.cast(correct_pred, tf.float32))
+
+            tf.contrib.losses.add_loss(self.cross_entropy)
+            self.total_loss = tf.contrib.losses.get_total_loss(add_regularization_losses=True)
+
+            self.global_step = tf.Variable(0, name='global_step', trainable=False)
+            self.optimizer = tf.train.AdamOptimizer(self.lr)
+            self.train_opt = self.optimizer.minimize(self.total_loss, global_step=self.global_step)
+
+            init = tf.global_variables_initializer()
+
+            sess_config = tf.ConfigProto()
+            sess_config.gpu_options.allow_growth=True
+            self.sess = tf.Session(config=sess_config)
+            self.sess.run(init)
+            self.prepare_logger(log_dir)
+        return None
+
+
+    def parse_cfgs(self, cfgs):
+        self.inp_dim = cfgs['inp_dim']
+        self.output_dim = cfgs['num_classes']
+        self.hidden_sizes = cfgs['hidden_sizes']
+        self.keep_prob = cfgs['keep_prob']
+        self.weight_decay = cfgs['weight_decay']
+        self.use_bn = cfgs['use_bn']
+        return None
+
+
+    def prepare_logger(self, log_dir):
+        # summary writer
+        self.saver = tf.train.Saver(max_to_keep=10)
+        if log_dir:
+            self.writer = tf.summary.FileWriter(log_dir, self.sess.graph)
+            tf.summary.scalar("total_loss", self.total_loss)
+            tf.summary.scalar("cross_entropy_loss", self.cross_entropy)
+            self.merged_summaries = tf.summary.merge_all()
+
+
+    def build_classifier(self, inp, hidden_sizes, outdim, scope):
+        out = inp
+        with tf.variable_scope(scope):
+            with slim.arg_scope([slim.fully_connected], 
+                weights_initializer=self.initializer(),
+                biases_initializer=tf.constant_initializer(0),
+                activation_fn=None,
+                weights_regularizer=slim.l2_regularizer(self.weight_decay)):              
+                for i in range(len(hidden_sizes)):
+                    out = slim.fully_connected(out, hidden_sizes[i], scope='fc%d'%(i+1))
+                    if self.use_bn: 
+                        out = self.bn_layer(out, scope='bn%d'%i)
+                    out = self.transfer(out)
+                    if self.keep_prob > 0 and self.keep_prob < 1:
+                        out = slim.dropout(out, self.keep_prob, 
+                            is_training=self.is_training, scope='dropout%d'%i)
+                out = slim.fully_connected(out, outdim, scope='fc%d'%(len(hidden_sizes)+1))
+        return out
+
+
+    def partial_fit(self, x, y, lr, get_summary=False):
+        summary = None
+        step = self.sess.run(self.global_step) 
+        if get_summary:
+            loss, acc, train_opt, summary = self.sess.run([self.total_loss, self.accuracy, 
+                self.train_opt, self.merged_summaries], 
+                feed_dict={self.x:x, self.y:y, self.lr:lr, self.is_training:True})
+        else:
+            loss, acc, train_opt = self.sess.run([self.total_loss, self.accuracy, self.train_opt], 
+                feed_dict={self.x:x, self.y:y, self.lr:lr, self.is_training:True})
+        return loss, acc, summary, step
+
+    def calc_loss_acc(self, x, y):
+        loss, acc = self.sess.run([self.total_loss, self.accuracy], 
+            feed_dict={self.x:x, self.y:y, self.lr:0, self.is_training:False})
+        return loss, acc
+
+    def bn_layer(self, inputs, scope):
+        bn = tf.contrib.layers.batch_norm(inputs, is_training=self.is_training, 
+            center=True, fused=False, scale=True, updates_collections=None, decay=0.9, scope=scope)
+        return bn
+
+    def predict(self, x):
+        dummy_y = np.zeros((x.shape[0], self.output_dim))
+        scores = self.sess.run(self.scores, feed_dict={self.x:x, self.y:dummy_y, self.lr:0, self.is_training:False})
+        preds = np.argmax(scores, axis=1)
+        return preds, scores 
+
+    def save(self, save_path, step):
+        self.saver.save(self.sess, save_path, global_step=step)
+
+    def restore(self, save_path):
+        self.saver.restore(self.sess, save_path)
+
+    def log(self, summary):
+        self.writer.add_summary(summary, global_step=self.sess.run(self.global_step))
